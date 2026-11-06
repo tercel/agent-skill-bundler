@@ -1,10 +1,11 @@
 # agent-skill-bundler
 
-Port Claude Code skill plugins to other agent platforms. **Codex** is the first
-target; the pipeline is target-agnostic (see *Adding another target*). Works on
-**any** standard Claude plugin, and is *tuned* for this workspace's `*-forge`
-plugins — registered ones get precise alias maps and **cross-plugin** reference
-rewriting (e.g. `code-forge` → `spec-forge`) that a generic converter can't do.
+Port Claude Code skill plugins to other agent platforms. **Codex** and
+**OpenCode** are implemented targets; the pipeline is target-agnostic (see
+*Adding another target*). Works on **any** standard Claude plugin, and is
+*tuned* for this workspace's `*-forge` plugins — registered ones get precise
+alias maps and **cross-plugin** reference rewriting (e.g. `code-forge` →
+`spec-forge`) that a generic converter can't do.
 
 Registered plugins (optional, for precision): `spec-forge`, `code-forge`,
 `apcore-skills`, `theory-forge`, `research-forge`, `hype-forge` (see
@@ -61,6 +62,55 @@ Transform passes applied to **every** `.md` (SKILL.md + bundled `references/`):
    (Codex reads only `name` + `description` from frontmatter).
 8. **Tool remap** — `AskUserQuestion` → "ask the user directly", etc.
 
+## Conversion model (OpenCode)
+
+OpenCode differs from Codex in three ways that shape the layout:
+
+- skill IDs are **path-derived** (`<dir>/SKILL.md` → `<dir>`); frontmatter
+  `name` is only a display label;
+- there is **no plugin namespace**, so bare aliases collide across plugins;
+- a directory containing `SKILL.md` is one skill — OpenCode **does not recurse
+  inside it**. The Codex bundle layout would therefore expose only the
+  orchestrator.
+
+So an OpenCode bundle is *rootless* and prefix-named:
+
+```
+code-forge/                    # container: NO SKILL.md here
+  code-forge/SKILL.md          # ID: code-forge (orchestrator)
+  code-forge-plan/SKILL.md     # ID: code-forge-plan
+  code-forge-build/SKILL.md    # ID: code-forge-build
+  code-forge-shared/...
+```
+
+Transform differences:
+
+- `/spec-forge:prd` → `spec-forge-prd` (the path-derived ID; `:` names do not
+  exist in OpenCode).
+- `Task(subagent_type="general-purpose")` → the `subagent` tool with the
+  built-in `general` agent; `reviewer` / `spec-author` / `analyst` are emitted as
+  OpenCode subagents and used when the delegation context names their role.
+- Claude `commands/*.md` are converted too: `commands/<ns>/plan.md` → `/ns/plan`,
+  and `commands/<ns>.md` → `/ns`. `$ARGUMENTS` / `$1` are preserved;
+  Claude-only `allowed-tools` / `argument-hint` are dropped, and `model` is kept
+  only when it is already `provider/model`. Command `@path` includes are inlined
+  (OpenCode does not expand them).
+- Custom agents are emitted as markdown (`agents/*.md`, `mode: subagent`).
+
+Install locations:
+
+```
+~/.config/opencode/skills/<ns>        # copy of the bundle (re-install after reconvert)
+~/.config/opencode/commands/<ns>      # copy of <out>/commands/<ns>
+~/.config/opencode/commands/<ns>.md   # suite entry -> /<ns>
+~/.config/opencode/agents/*.md        # copied subagents
+```
+
+OpenCode also scans the Codex compatibility dirs (`~/.agents/skills`,
+`~/.claude/skills`). A Codex bundle installed there only registers its root
+skill (the root `SKILL.md` blocks recursion); the prefixed OpenCode bundle in
+`~/.config/opencode/skills` wins for the root ID and adds every sub-skill.
+
 ## Self-enforced gates (no half-product)
 
 `convert` exits non-zero if any bundle violates a gate:
@@ -68,8 +118,12 @@ Transform passes applied to **every** `.md` (SKILL.md + bundled `references/`):
 - **A** — no unresolved external `@../` include remains.
 - **B** — no leftover Claude-style **slash** ref (`/<ns>:<skill>`) remains (the
   bare `<ns>:<skill>` colon form is the correct Codex name and is allowed).
+- **B2** — prefix targets (OpenCode): no leftover bare `<ns>:<skill>` colon ref
+  either; the only valid form is `<ns>-<skill>`.
 - **C** — every skill's directory name equals its frontmatter `name`.
 - **D** — every relocated `<ns>-shared/...` reference resolves on disk.
+- **E** — rootless targets (OpenCode): no `SKILL.md` at the bundle root (it
+  would hide every sub-skill) and the orchestrator exists at `<ns>/SKILL.md`.
 
 Non-fatal **warnings** surface source-side issues the conversion can't fix:
 dangling cross-refs (`spec-forge:feature`), ambiguous cross-plugin bare paths,
@@ -96,25 +150,40 @@ npm install && npm run build
 
 # convert one or more plugins (gates enforced)
 agent-skill-bundler convert ../spec-forge ../code-forge ../apcore-skills --out ./out/codex
+agent-skill-bundler convert ../spec-forge ../code-forge --target opencode
 
-# verify a bundle actually loads in Codex (no model call; needs codex installed)
-agent-skill-bundler verify ./out/codex/spec-forge
+# verify a bundle actually loads in the target
+agent-skill-bundler verify ./out/codex/spec-forge            # codex debug prompt-input
+agent-skill-bundler verify ./out/opencode/code-forge         # static OpenCode scan check
 
-# install a bundle into Codex (symlink; Codex follows it for discovery)
-agent-skill-bundler install ./out/codex/spec-forge          # -> ~/.agents/skills/spec-forge
-agent-skill-bundler install ./out/codex/spec-forge --codex-home /tmp/test
+# install a bundle (Codex symlinks; OpenCode copies so its scanner cannot miss it)
+agent-skill-bundler install ./out/codex/spec-forge               # -> ~/.agents/skills/spec-forge
+agent-skill-bundler install ./out/opencode/code-forge            # -> ~/.config/opencode/skills/code-forge
+agent-skill-bundler install ./out/codex/spec-forge --home /tmp/test
 ```
 
+`install` / `verify` infer the target from the bundle shape unless `--target`
+is given: a root `SKILL.md` means Codex, `<ns>/SKILL.md` means OpenCode.
+`install` replaces an existing `<ns>` entry in the target's skills dir (and the
+matching command/agent entries), so re-running it after a reconvert is safe.
+
 In Codex: restart, then `/skills` or name a skill, e.g. `spec-forge:prd`.
+
+In OpenCode: config reloads automatically; use `/code-forge/plan`, or load a
+skill by ID (`code-forge-plan`) or mention `@code-forge-plan`.
 
 ## Verifying (three tiers)
 
 1. **Gates** — `convert` fails on dangling includes / leftover slash refs /
    name mismatch / unresolved shared paths. (Output is well-formed.)
-2. **Runtime discovery** — `agent-skill-bundler verify <bundle>` installs into a throwaway
-   HOME and runs `codex debug prompt-input` (renders the model-visible prompt
-   with **no model call, no cost**); asserts every expected `<ns>:<skill>` was
-   discovered. (Codex actually loads them.)
+2. **Runtime discovery** — `agent-skill-bundler verify <bundle>` installs into a
+   throwaway HOME and checks the target's discovery. For Codex it runs
+   `codex debug prompt-input` (renders the model-visible prompt with **no model
+   call, no cost**) and asserts every expected `<ns>:<skill>` was discovered.
+   OpenCode has no equivalent prompt dump, so its verify mirrors the documented
+   scan rules statically (root-level `*.md` + nested `SKILL.md`, stop at a
+   `SKILL.md`, skip hidden/`node_modules`, six levels deep) and reports command
+   entries. (Output layout is valid.)
 3. **Interactive** — `codex` → `/skills`, then invoke `spec-forge:prd` on a real
    task and watch it run. (End-to-end; this one calls the model.)
 
@@ -124,9 +193,12 @@ safety on the converter itself.
 ## Adding another target (Gemini, OpenCode, ...)
 
 The core pipeline is target-agnostic; a target is data in `src/targets.ts`
-(`skillsDir`, `toolRemap`, `expandsAtIncludes`). Gemini, for example, natively
-expands `@` includes and supports namespaced `.toml` commands, so its target
-would set `expandsAtIncludes: true` and use a different layout emitter.
+(`skillsDir`, `commandsDir`, `nameStyle`, `layout`, `toolRemap`,
+`expandsAtIncludes`, agent format). `nameStyle` + `layout` are the two axes that
+matter: `namespace`/`bundle` (Codex) vs `prefix`/`rootless` (OpenCode). Gemini,
+for example, natively expands `@` includes and supports namespaced `.toml`
+commands, so its target would set `expandsAtIncludes: true` and use a different
+layout emitter.
 
 ## Scope
 

@@ -6,16 +6,18 @@ import {
   KNOWN_NAMESPACES,
   resolvePlugin,
   aliasFor,
-  codexSkillName,
-  codexQualifiedName,
+  targetSkillDir,
+  targetSkillRef,
+  targetRootRef,
   type PluginSpec,
 } from './registry.js';
-import { type Target } from './targets.js';
+import { CODEX, type Target } from './targets.js';
 
 export interface ConvertResult {
   ns: string;
   bundleDir: string;
   skills: string[];
+  commands: number;
   inlined: number;
   bundledReads: number;
   crossRefs: number;
@@ -25,13 +27,16 @@ export interface ConvertResult {
 }
 
 /** Codex-visible skill names a plugin produces (for cross-ref validation). */
-export function pluginSkillNames(pluginDir: string): { ns: string; names: Set<string> } {
+export function pluginSkillNames(
+  pluginDir: string,
+  target: Target = CODEX,
+): { ns: string; names: Set<string> } {
   const pj = path.join(pluginDir, '.claude-plugin', 'plugin.json');
   const ns = String((JSON.parse(read(pj)) as Record<string, unknown>)['name']);
   const spec = resolvePlugin(ns);
-  const names = new Set<string>([`${ns}:${ns}`]); // orchestrator root skill
+  const names = new Set<string>([targetRootRef(spec, target)]); // orchestrator root skill
   for (const d of listSkillDirs(path.join(pluginDir, 'skills'), spec)) {
-    names.add(codexQualifiedName(spec, d)); // <ns>:<alias>
+    names.add(targetSkillRef(spec, target, d)); // <ns>:<alias> or <ns>-<alias>
   }
   return { ns, names };
 }
@@ -140,7 +145,7 @@ function adaptSubagents(body: string, target: Target): { body: string; count: nu
       }
       // no backticks around the agent name — the source often wraps the whole
       // Task(...) token in backticks, and nested backticks break markdown.
-      let s = `a subagent (Codex ${agent} agent)`;
+      let s = target.subagentPhrase.replace('{agent}', agent);
       if (pm) s += ` using the ${pm[1]}`;
       return s;
     });
@@ -153,77 +158,106 @@ function tomlStr(s: string): string {
   return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
-/** Emit the target's custom agents as `<outRoot>/.codex/agents/<name>.toml`. */
+/**
+ * Emit the target's custom agents as `.codex/agents/*.toml` (Codex) or
+ * `agents/*.md` (OpenCode).
+ */
 export function writeCustomAgents(outRoot: string, target: Target): string[] {
-  const dir = path.join(outRoot, '.codex', 'agents');
+  if (!target.agentFormat || target.customAgents.length === 0) return [];
+  const dir = path.join(outRoot, target.agentsOutDir);
+  const ext = target.agentFormat === 'toml' ? 'toml' : 'md';
   const written: string[] = [];
   for (const a of target.customAgents) {
-    let toml =
-      `name = ${tomlStr(a.name)}\n` +
-      `description = ${tomlStr(a.description)}\n` +
-      `developer_instructions = ${tomlStr(a.developer_instructions)}\n`;
-    if (a.model_reasoning_effort) {
-      toml += `model_reasoning_effort = ${tomlStr(a.model_reasoning_effort)}\n`;
+    let content: string;
+    if (target.agentFormat === 'toml') {
+      content =
+        `name = ${tomlStr(a.name)}\n` +
+        `description = ${tomlStr(a.description)}\n` +
+        `developer_instructions = ${tomlStr(a.developer_instructions)}\n`;
+      if (a.model_reasoning_effort) {
+        content += `model_reasoning_effort = ${tomlStr(a.model_reasoning_effort)}\n`;
+      }
+    } else {
+      // OpenCode: Markdown frontmatter + body. `mode: subagent` makes it
+      // launchable through the subagent tool but not selectable as primary.
+      const fm = YAML.stringify({
+        description: a.description,
+        mode: 'subagent',
+      }).trimEnd();
+      content = `---\n${fm}\n---\n\n${a.developer_instructions}\n`;
     }
-    const file = path.join(dir, `${a.name}.toml`);
-    write(file, toml);
+    const file = path.join(dir, `${a.name}.${ext}`);
+    write(file, content);
     written.push(file);
   }
   return written;
 }
 
 /**
- * Rewrite Claude slash-command cross-references into Codex skill mentions. Codex
- * auto-namespaces by bundle dir (a skill is `<ns>:<alias>`), and the `$`-prefix
- * is Codex's user-invocation mention. A Claude slash command means "invoke this",
- * so it maps to `$<ns>:<alias>`. Bare prose refs (no slash) are left untouched.
- *   /spec-forge:prd  ->  $spec-forge:prd
- *   /spec-forge      ->  $spec-forge:spec-forge   (orchestrator skill)
- *   spec-forge:prd   ->  spec-forge:prd           (unchanged prose reference)
+ * Rewrite Claude slash-command cross-references into target-visible skill
+ * mentions. A Claude slash command means "invoke this", which maps to:
+ * - namespace targets: `$<ns>:<alias>` (Codex's mention syntax);
+ * - prefix targets: the bare path-derived ID `<ns>-<alias>` (OpenCode), since
+ *   they have no `:` namespace and `@` mentions are user-prompt syntax.
+ * Bare prose refs (no slash) are left untouched.
+ *   /spec-forge:prd  ->  $spec-forge:prd   |  spec-forge-prd
+ *   /spec-forge      ->  $spec-forge:spec-forge | spec-forge
+ *   spec-forge:prd   ->  spec-forge:prd    | unchanged prose reference
  */
 function rewriteCrossRefs(
   body: string,
   namespaces: string[] = KNOWN_NAMESPACES,
+  target?: Target,
 ): { body: string; count: number } {
   let count = 0;
   let out = body;
+  const prefixStyle = target?.nameStyle === 'prefix';
   for (const ns of namespaces) {
     // slash + namespaced invocation: /spec-forge:prd -> $spec-forge:prd
     const sub = new RegExp(`/\\b${ns}:([a-z][a-z0-9-]*)`, 'g');
     out = out.replace(sub, (_m, token: string) => {
       count++;
-      return `$${ns}:${token}`;
+      return prefixStyle ? `${ns}-${token}` : `$${ns}:${token}`;
     });
     // bare orchestrator invocation: /spec-forge -> $spec-forge:spec-forge
     const orch = new RegExp(`/${ns}(?![\\w:-])`, 'g');
     out = out.replace(orch, () => {
       count++;
-      return `$${ns}:${ns}`;
+      return prefixStyle ? ns : `$${ns}:${ns}`;
     });
+    // prefix targets have no `:` namespace, so bare colon refs are invalid too:
+    // code-forge:plan -> code-forge-plan
+    if (prefixStyle) {
+      const bare = new RegExp(`\\b${ns}:([a-z][a-z0-9-]*)`, 'g');
+      out = out.replace(bare, (_m, token: string) => {
+        count++;
+        return `${ns}-${token}`;
+      });
+    }
   }
   return { body: out, count };
 }
 
 /**
  * Rewrite intra-plugin path references like `../skills/review/SKILL.md` or
- * `skills/prd-generation/SKILL.md` into the Codex `<ns>:<alias>` skill name,
- * since that file layout no longer exists in the flattened Codex bundle.
+ * `skills/prd-generation/SKILL.md` into the target's skill name, since that
+ * file layout no longer exists in the flattened bundle.
  */
 function rewriteSkillPaths(
   body: string,
   spec: PluginSpec,
   currentSkills: Set<string>,
+  target: Target,
 ): { body: string; count: number } {
   let count = 0;
   const out = body.replace(
     /(?:\.\.\/)*skills\/([a-z][a-z0-9-]*)\/SKILL\.md/g,
     (m, dir: string) => {
       // Only rewrite refs to THIS plugin's own skills — a bare path to another
-      // plugin's skill (e.g. spec-forge's from code-forge docs) is ambiguous and
-      // left for the leftover-path warning to surface.
+      // plugin's skill is ambiguous and left for the leftover-path warning.
       if (!currentSkills.has(dir)) return m;
       count++;
-      return `\`${codexQualifiedName(spec, dir)}\``;
+      return `\`${targetSkillRef(spec, target, dir)}\``;
     },
   );
   return { body: out, count };
@@ -270,6 +304,7 @@ function resolveIncludes(
   body: string,
   skillDir: string,
   target: Target,
+  inlineInternal = false,
 ): { body: string; inlined: number; bundledReads: number } {
   let inlined = 0;
   let bundledReads = 0;
@@ -291,7 +326,7 @@ function resolveIncludes(
       continue;
     }
     const insideSkill = !path.relative(skillDir, abs).startsWith('..');
-    if (insideSkill && !target.expandsAtIncludes) {
+    if (insideSkill && !inlineInternal && !target.expandsAtIncludes) {
       const hint = trailing ? ` ${trailing}` : '';
       out.push(`> Read the bundled file \`${rel}\`${hint} for full details.`);
       bundledReads++;
@@ -369,9 +404,9 @@ function transformFile(
   body = remapTools(body, target);
   const sa = adaptSubagents(body, target);
   body = sa.body;
-  const cr = rewriteCrossRefs(body, namespaces);
+  const cr = rewriteCrossRefs(body, namespaces, target);
   body = cr.body;
-  const sp = rewriteSkillPaths(body, spec, currentSkills);
+  const sp = rewriteSkillPaths(body, spec, currentSkills, target);
   body = sp.body;
   body = relocateSharedPaths(body, path.dirname(destFile), bundleDir, spec.ns, sharedDirs).body;
   stats.subagents += sa.count;
@@ -381,8 +416,8 @@ function transformFile(
   if (typeof data['description'] === 'string') {
     let d = remapTools(data['description'], target);
     d = adaptSubagents(d, target).body;
-    d = rewriteCrossRefs(d, namespaces).body;
-    d = rewriteSkillPaths(d, spec, currentSkills).body;
+    d = rewriteCrossRefs(d, namespaces, target).body;
+    d = rewriteSkillPaths(d, spec, currentSkills, target).body;
     d = relocateSharedPaths(d, path.dirname(destFile), bundleDir, spec.ns, sharedDirs).body;
     data['description'] = d;
   }
@@ -441,8 +476,12 @@ function generateOrchestrator(
   stats: Stats,
 ): void {
   const cmdFile = path.join(pluginDir, 'commands', `${spec.ns}.md`);
+  // Rootless bundles keep the orchestrator one level down; shared-path
+  // relocation must be relative to the file, not the container dir.
+  const orchestratorDir =
+    target.layout === 'rootless' ? path.join(bundleDir, spec.ns) : bundleDir;
   const rows = skillDirs
-    .map((d) => `| \`$${codexQualifiedName(spec, d)}\` | ${aliasFor(spec, d)} |`)
+    .map((d) => `| \`${targetSkillRef(spec, target, d)}\` | ${aliasFor(spec, d)} |`)
     .join('\n');
 
   let body: string;
@@ -452,33 +491,59 @@ function generateOrchestrator(
     const sa = adaptSubagents(body, target);
     body = sa.body;
     stats.subagents += sa.count;
-    body = rewriteCrossRefs(body, namespaces).body;
-    body = rewriteSkillPaths(body, spec, new Set(skillDirs)).body;
-    body = relocateSharedPaths(body, bundleDir, bundleDir, spec.ns, spec.sharedDirs ?? ['shared']).body;
+    body = rewriteCrossRefs(body, namespaces, target).body;
+    body = rewriteSkillPaths(body, spec, new Set(skillDirs), target).body;
+    body = relocateSharedPaths(body, orchestratorDir, bundleDir, spec.ns, spec.sharedDirs ?? ['shared']).body;
   } else {
     body = `# ${spec.ns}\n\nOrchestrator for the ${spec.ns} skill suite.\n`;
   }
 
   const header =
-    `# ${spec.ns}\n\n` +
-    `Orchestrator entry point for the **${spec.ns}** suite. Codex namespaces these ` +
-    `by bundle directory; invoke a capability by naming its skill (or via /skills):\n\n` +
-    `| Codex skill | Capability |\n|---|---|\n${rows}\n\n` +
-    `When asked to run the full ${spec.ns} chain, follow the workflow below.\n\n---\n\n`;
+    target.nameStyle === 'prefix'
+      ? `# ${spec.ns}\n\n` +
+        `Orchestrator entry point for the **${spec.ns}** suite. These skills have no ` +
+        `plugin namespace; load a capability with the \`skill\` tool by its ID ` +
+        `(or mention \`@<id>\`):\n\n` +
+        `| Skill ID | Capability |\n|---|---|\n${rows}\n\n` +
+        `When asked to run the full ${spec.ns} chain, follow the workflow below.\n\n---\n\n`
+      : `# ${spec.ns}\n\n` +
+        `Orchestrator entry point for the **${spec.ns}** suite. Codex namespaces these ` +
+        `by bundle directory; invoke a capability by naming its skill (or via /skills):\n\n` +
+        `| Codex skill | Capability |\n|---|---|\n${rows}\n\n` +
+        `When asked to run the full ${spec.ns} chain, follow the workflow below.\n\n---\n\n`;
 
   const rawDesc = (pluginJson['description'] as string) ?? `${spec.ns} skill orchestrator`;
   const data: Record<string, unknown> = {
     name: spec.ns,
-    description: rewriteCrossRefs(remapTools(rawDesc, target), namespaces).body,
+    description: rewriteCrossRefs(remapTools(rawDesc, target), namespaces, target).body,
   };
-  write(path.join(bundleDir, 'SKILL.md'), joinFrontmatter(data, header + body));
+  // Rootless targets keep the bundle dir as a plain container: a SKILL.md at its
+  // root would make the agent treat the whole bundle as one skill and stop
+  // recursing, hiding every sub-skill.
+  const dest =
+    target.layout === 'rootless'
+      ? path.join(bundleDir, spec.ns, 'SKILL.md')
+      : path.join(bundleDir, 'SKILL.md');
+  write(dest, joinFrontmatter(data, header + body));
 }
 
 // ---------- verification gates ----------
 
-function verify(bundleDir: string): string[] {
+function verify(bundleDir: string, target: Target): string[] {
   const violations: string[] = [];
   const ns = path.basename(bundleDir);
+
+  // Gate E: layout invariants. A rootless agent stops recursing at a SKILL.md,
+  // so a bundle-root SKILL.md would hide every sub-skill.
+  if (target.layout === 'rootless') {
+    if (exists(path.join(bundleDir, 'SKILL.md'))) {
+      violations.push(`${bundleDir}: SKILL.md at bundle root would hide every sub-skill`);
+    }
+    if (!exists(path.join(bundleDir, ns, 'SKILL.md'))) {
+      violations.push(`${bundleDir}: missing orchestrator skill at ${ns}/SKILL.md`);
+    }
+  }
+
   const mdFiles: string[] = [];
   const walk = (dir: string) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -508,6 +573,16 @@ function verify(bundleDir: string): string[] {
         break;
       }
     }
+    // Gate B2 (prefix targets): the bare `<ns>:<skill>` colon form is valid in
+    // Codex but is not a skill ID in a namespace-less target.
+    if (target.nameStyle === 'prefix') {
+      for (const ns of KNOWN_NAMESPACES) {
+        if (new RegExp(`\\b${ns}:[a-z][a-z0-9-]*`).test(md)) {
+          violations.push(`${f}: leftover colon ref "${ns}:..." (prefix target)`);
+          break;
+        }
+      }
+    }
     // Gate C: skill dir name == frontmatter name (per-skill SKILL.md only)
     if (isSkillMd && !isRootSkill) {
       const dirName = path.basename(path.dirname(f));
@@ -532,10 +607,11 @@ function verify(bundleDir: string): string[] {
 
 // ---------- public entry ----------
 
-/** Scan a bundle for `<ns>:<skill>` refs that resolve to no known skill. */
+/** Scan a bundle for target-style refs that resolve to no known skill. */
 function findUnresolvedRefs(
   bundleDir: string,
   known: Map<string, Set<string>>,
+  target: Target,
 ): string[] {
   const unresolved = new Set<string>();
   const walk = (dir: string) => {
@@ -545,7 +621,12 @@ function findUnresolvedRefs(
       else if (e.name.endsWith('.md')) {
         const text = read(p);
         for (const [ns, names] of known) {
-          const re = new RegExp(`\\b(${ns}:[a-z][a-z0-9-]*)`, 'g');
+          // Prefix targets have no `:`; match `<ns>-<id>` but not the
+          // `<ns>-shared/` path that travels with the bundle.
+          const re =
+            target.nameStyle === 'prefix'
+              ? new RegExp(`\\b(${ns}-[a-z][a-z0-9-]*)(?![a-z0-9-]|/)`, 'g')
+              : new RegExp(`\\b(${ns}:[a-z][a-z0-9-]*)`, 'g');
           let m: RegExpExecArray | null;
           while ((m = re.exec(text))) {
             if (!names.has(m[1])) unresolved.add(m[1]);
@@ -556,6 +637,97 @@ function findUnresolvedRefs(
   };
   walk(bundleDir);
   return [...unresolved].sort();
+}
+
+/**
+ * Convert Claude slash commands (`commands/*.md`) into target command files.
+ * OpenCode scans every `.md` file under `<commandsDir>` and names them by
+ * relative path, so `<out>/commands/<ns>/plan.md` installs to
+ * `~/.config/opencode/commands/<ns>/plan.md` and runs as `/ns/plan`. Claude's
+ * `$ARGUMENTS` and `$1` placeholders are unchanged. The suite entry
+ * `commands/<ns>.md` becomes `/ns`.
+ */
+function convertCommands(
+  spec: PluginSpec,
+  target: Target,
+  pluginDir: string,
+  outRoot: string,
+  currentSkills: Set<string>,
+  namespaces: string[],
+  stats: Stats,
+): { count: number; warnings: string[] } {
+  const warnings: string[] = [];
+  const srcDir = path.join(pluginDir, 'commands');
+  if (!target.commandsDir || !exists(srcDir)) return { count: 0, warnings };
+
+  const sharedDirs = spec.sharedDirs ?? ['shared'];
+  const bundleDir = path.join(outRoot, spec.ns);
+  const names = fs
+    .readdirSync(srcDir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith('.md'))
+    .map((e) => e.name)
+    .sort();
+
+  let count = 0;
+  const dropped = new Map<string, number>();
+  for (const name of names) {
+    const src = path.join(srcDir, name);
+    const { data, body: rawBody } = splitFrontmatter(read(src));
+    const cmdName = name.replace(/\.md$/, '');
+    const dest =
+      cmdName === spec.ns
+        ? path.join(outRoot, 'commands', name)
+        : path.join(outRoot, 'commands', spec.ns, name);
+    const destDir = path.dirname(dest);
+
+    // Command templates do not expand @path and travel as standalone files, so
+    // every real include is inlined (internal ones included).
+    let body = resolveIncludes(rawBody, srcDir, target, true).body;
+    body = remapTools(body, target);
+    const sa = adaptSubagents(body, target);
+    body = sa.body;
+    stats.subagents += sa.count;
+    body = rewriteCrossRefs(body, namespaces, target).body;
+    body = rewriteSkillPaths(body, spec, currentSkills, target).body;
+    body = relocateSharedPaths(body, destDir, bundleDir, spec.ns, sharedDirs).body;
+
+    // Keep only frontmatter OpenCode understands; Claude-only fields are dropped.
+    const out: Record<string, unknown> = {};
+    if (typeof data['description'] === 'string') {
+      let d = remapTools(data['description'], target);
+      d = rewriteCrossRefs(d, namespaces, target).body;
+      d = rewriteSkillPaths(d, spec, currentSkills, target).body;
+      out['description'] = d;
+    }
+    for (const key of ['agent', 'subagent', 'subtask']) {
+      if (key in data) out[key] = data[key];
+    }
+    if (typeof data['model'] === 'string') {
+      if (data['model'].includes('/')) out['model'] = data['model'];
+      else warnings.push(`${src}: dropped command model "${data['model']}" (needs provider/model)`);
+    }
+    for (const key of ['allowed-tools', 'argument-hint', 'name']) {
+      if (key in data) dropped.set(key, (dropped.get(key) ?? 0) + 1);
+    }
+
+    // Same leftover-slash guarantee as the skill body gate.
+    for (const ns of KNOWN_NAMESPACES) {
+      if (new RegExp(`/\\b${ns}:[a-z*]`).test(`${JSON.stringify(out)}\n${body}`)) {
+        warnings.push(`${src}: leftover Claude-style slash ref "/${ns}:..."`);
+        break;
+      }
+    }
+
+    write(
+      dest,
+      Object.keys(out).length ? joinFrontmatter(out, body) : body,
+    );
+    count++;
+  }
+  for (const [key, n] of dropped) {
+    warnings.push(`${n} command file(s): dropped Claude-only frontmatter "${key}"`);
+  }
+  return { count, warnings };
 }
 
 export function convertPlugin(
@@ -584,13 +756,18 @@ export function convertPlugin(
   const bundleDir = path.join(outRoot, ns);
   fs.rmSync(bundleDir, { recursive: true, force: true });
   fs.mkdirSync(bundleDir, { recursive: true });
+  if (target.commandsDir) {
+    // Clear this plugin's previous command output so deleted commands don't linger.
+    fs.rmSync(path.join(outRoot, 'commands', ns), { recursive: true, force: true });
+    fs.rmSync(path.join(outRoot, 'commands', `${ns}.md`), { force: true });
+  }
 
   const stats: Stats = { inlined: 0, bundledReads: 0, crossRefs: 0, subagents: 0 };
   const produced: string[] = [];
 
   const currentSkills = new Set(skillDirs);
   for (const d of skillDirs) {
-    const destName = codexSkillName(spec, d);
+    const destName = targetSkillDir(spec, target, d);
     convertSkill(
       spec,
       target,
@@ -619,20 +796,32 @@ export function convertPlugin(
 
   generateOrchestrator(spec, target, pluginDir, bundleDir, skillDirs, pluginJson, namespaces, stats);
 
-  // Codex plugin manifest
-  write(
-    path.join(bundleDir, '.codex-plugin', 'plugin.json'),
-    JSON.stringify(
-      {
-        name: ns,
-        version: pluginJson['version'] ?? '0.0.0',
-        description: pluginJson['description'] ?? '',
-        skills: './',
-      },
-      null,
-      2,
-    ),
+  const cmdResult = convertCommands(
+    spec,
+    target,
+    pluginDir,
+    outRoot,
+    currentSkills,
+    namespaces,
+    stats,
   );
+
+  // Plugin manifest (Codex only; OpenCode discovers skills/commands by path).
+  if (target.pluginManifest) {
+    write(
+      path.join(bundleDir, target.pluginManifest),
+      JSON.stringify(
+        {
+          name: ns,
+          version: pluginJson['version'] ?? '0.0.0',
+          description: pluginJson['description'] ?? '',
+          skills: './',
+        },
+        null,
+        2,
+      ),
+    );
+  }
 
   // Drop the relocated shared dir if nothing ended up referencing it (plugins
   // whose shared content was fully inlined via @-includes).
@@ -648,18 +837,22 @@ export function convertPlugin(
       }
     };
     scan(bundleDir);
+    // Commands live beside the bundle; they can be the only consumer of shared.
+    const commandsOut = path.join(outRoot, 'commands');
+    if (target.commandsDir && exists(commandsOut)) scan(commandsOut);
     if (!referenced) fs.rmSync(sharedDest, { recursive: true, force: true });
   }
 
-  const violations = verify(bundleDir);
+  const violations = verify(bundleDir, target);
   const warnings = known
-    ? findUnresolvedRefs(bundleDir, known).map(
+    ? findUnresolvedRefs(bundleDir, known, target).map(
         (r) => `cross-ref ${r} resolves to no known skill (source-side dangling ref)`,
       )
     : [];
+  warnings.push(...cmdResult.warnings);
 
   // Safety net: every Task(subagent_type=...) should have been adapted to a
-  // Codex subagent. Any survivor means an unmatched form needing manual review.
+  // target subagent. Any survivor means an unmatched form needing manual review.
   let taskSites = 0;
   const countTasks = (dir: string) => {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -699,6 +892,7 @@ export function convertPlugin(
     ns,
     bundleDir,
     skills: produced,
+    commands: cmdResult.count,
     inlined: stats.inlined,
     bundledReads: stats.bundledReads,
     crossRefs: stats.crossRefs,

@@ -6,6 +6,8 @@
 // own-namespace cross-ref rewriting). Register a plugin only when you need its
 // aliases or want its namespace recognized in OTHER plugins' cross-references.
 
+import type { Target } from './targets.js';
+
 export interface PluginSpec {
   /** Plugin namespace (matches .claude-plugin/plugin.json name). */
   ns: string;
@@ -112,4 +114,26 @@ export function codexSkillName(spec: PluginSpec, skillDir: string): string {
 /** Codex-visible qualified name `<ns>:<alias>` (e.g. spec-forge:prd). */
 export function codexQualifiedName(spec: PluginSpec, skillDir: string): string {
   return `${spec.ns}:${aliasFor(spec, skillDir)}`;
+}
+
+/**
+ * Directory (and therefore skill ID) a sub-skill gets under a target:
+ * - namespace targets keep the bare alias (the parent bundle namespaces it);
+ * - prefix targets flatten the namespace into the ID (`code-forge-plan`),
+ *   because they have no plugin namespace and bare IDs collide across plugins.
+ */
+export function targetSkillDir(spec: PluginSpec, target: Target, skillDir: string): string {
+  const alias = aliasFor(spec, skillDir);
+  return target.nameStyle === 'prefix' ? `${spec.ns}-${alias}` : alias;
+}
+
+/** A sub-skill reference in its target-visible form (`ns:alias` or `ns-alias`). */
+export function targetSkillRef(spec: PluginSpec, target: Target, skillDir: string): string {
+  const name = targetSkillDir(spec, target, skillDir);
+  return target.nameStyle === 'prefix' ? name : `${spec.ns}:${name}`;
+}
+
+/** The orchestrator skill's target-visible reference. */
+export function targetRootRef(spec: PluginSpec, target: Target): string {
+  return target.nameStyle === 'prefix' ? spec.ns : `${spec.ns}:${spec.ns}`;
 }
