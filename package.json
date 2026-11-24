@@ -1,6 +1,6 @@
 {
   "name": "agent-skill-bundler",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Port Claude Code skill plugins to other agent platforms — Codex, OpenCode, and Gemini CLI targets. Produces namespace-prefixed skills, inlined shared includes, cross-plugin reference rewriting, slash-command conversion, and self-enforced gates.",
   "type": "module",
   "bin": {

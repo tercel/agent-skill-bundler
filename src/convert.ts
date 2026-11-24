@@ -370,7 +370,28 @@ interface GeminiConversion {
   suiteBody?: string;
   routes: Map<string, string>;
   warnings: string[];
+  metaWarnings: Map<string, Set<string>>;
   violations: string[];
+}
+
+function recordGeminiMetaWarnings(gemini: GeminiConversion, source: string, warnings: string[]): void {
+  for (const warning of warnings) {
+    let files = gemini.metaWarnings.get(warning);
+    if (!files) {
+      files = new Set<string>();
+      gemini.metaWarnings.set(warning, files);
+    }
+    files.add(source);
+  }
+}
+
+function summarizeGeminiMetaWarnings(gemini: GeminiConversion): string[] {
+  const out: string[] = [];
+  for (const [warning, files] of gemini.metaWarnings) {
+    if (files.size === 1) out.push(`${[...files][0]}: ${warning}`);
+    else out.push(`${files.size} file(s): ${warning}`);
+  }
+  return out;
 }
 
 function inside(root: string, child: string): boolean {
@@ -1029,7 +1050,7 @@ function convertGeminiCommands(
     const data = { ...fields.data, ...command.metadata };
     const meta = normalizeGeminiSkill(data, fields.body, command.name);
     const previousViolations = gemini.violations.length;
-    gemini.warnings.push(...meta.warnings.map((warning) => `${command.source}: ${warning}`));
+    recordGeminiMetaWarnings(gemini, command.source, meta.warnings);
     gemini.violations.push(...meta.violations.map((violation) => `${command.source}: ${violation}`));
     if (meta.violations.length) continue;
 
@@ -1122,6 +1143,7 @@ export function convertPlugin(
     orchestrator: geminiSkillId(ns),
     routes: new Map(knownRoutes),
     warnings: [],
+    metaWarnings: new Map(),
     violations: [],
   };
   const geminiCommands = new Map(sourcePlugin?.commands.map((command) => [command.name, command]));
@@ -1132,7 +1154,7 @@ export function convertPlugin(
   const planned = sources.flatMap((source) => {
     if (!gemini) return [{ source, id: targetSkillDir(spec, target, source.name) }];
     const { id, file, markdown, meta, commandName } = planGeminiSkill(source, spec, target);
-    gemini.warnings.push(...meta.warnings.map((warning) => `${file}: ${warning}`));
+    recordGeminiMetaWarnings(gemini, file, meta.warnings);
     gemini.violations.push(...meta.violations.map((violation) => `${file}: ${violation}`));
     if (meta.violations.length) return [];
     if (normalizedSkills.has(id) || (!source.root && id === gemini.orchestrator)) {
@@ -1214,7 +1236,7 @@ export function convertPlugin(
       count: convertGeminiCommands(
         [...geminiCommands.values()], gemini, spec, target, outRoot, currentSkills, namespaces, stats, rootAssets,
       ),
-      warnings: gemini.warnings,
+      warnings: [...gemini.warnings, ...summarizeGeminiMetaWarnings(gemini)],
     }
     : convertCommands(spec, target, pluginDir, outRoot, currentSkills, namespaces, stats);
   // A real plugin-root skill already occupies the namespace. Keep a

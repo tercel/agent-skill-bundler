@@ -28,6 +28,7 @@ function parse(argv: string[]): Args {
     } else if (t === '--no-strict') a.strict = false;
     else if (t === '--home' || t === '--codex-home') a.home = argv[++i];
     else if (t === '-h' || t === '--help') a._.push('help');
+    else if (t === '-v' || t === '--version') a._.push('version');
     else a._.push(t);
   }
   return a;
@@ -40,6 +41,7 @@ Usage:
   agent-skill-bundler convert <pluginDir...> [--out <dir>] [--target codex|opencode|gemini] [--no-strict]
   agent-skill-bundler verify  <bundleDir> [--target codex|opencode|gemini] [--home <path>]
   agent-skill-bundler install <bundleDir> [--target codex|opencode|gemini] [--home <path>]
+  agent-skill-bundler --version | -v
 
 Targets:
   codex     ~/.agents/skills; namespaced skill names (<ns>:<alias>); no commands.
@@ -445,6 +447,13 @@ function main(): number {
   if (!cmd || cmd === 'help') {
     usage();
     return cmd ? 0 : 1;
+  }
+  if (cmd === 'version') {
+    const pkg = JSON.parse(
+      fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    ) as { version?: string };
+    process.stdout.write(`${pkg.version ?? '0.0.0'}\n`);
+    return 0;
   }
   switch (cmd) {
     case 'convert':
