@@ -70,7 +70,7 @@ export const KNOWN_NAMESPACES = Object.keys(REGISTRY);
 
 /** Resolve a plugin spec by namespace, throwing if unknown. */
 export function getPlugin(ns: string): PluginSpec {
-  const spec = REGISTRY[ns];
+  const spec = Object.hasOwn(REGISTRY, ns) ? REGISTRY[ns] : undefined;
   if (!spec) {
     throw new Error(
       `Unknown plugin namespace "${ns}". Known: ${KNOWN_NAMESPACES.join(', ')}. ` +
@@ -88,17 +88,17 @@ export function getPlugin(ns: string): PluginSpec {
  * excludes reference dirs), and the conventional ['shared'] relocation.
  */
 export function resolvePlugin(ns: string): PluginSpec {
-  return REGISTRY[ns] ?? { ns, nonSkillDirs: [], aliases: {} };
+  return Object.hasOwn(REGISTRY, ns) ? REGISTRY[ns] : { ns, nonSkillDirs: [], aliases: {} };
 }
 
 /** Whether a namespace is a registered (forge) plugin. */
 export function isRegistered(ns: string): boolean {
-  return ns in REGISTRY;
+  return Object.hasOwn(REGISTRY, ns);
 }
 
 /** Short alias for a skill directory (alias map or identity). */
 export function aliasFor(spec: PluginSpec, skillDir: string): string {
-  return spec.aliases[skillDir] ?? skillDir;
+  return Object.hasOwn(spec.aliases, skillDir) ? spec.aliases[skillDir] : skillDir;
 }
 
 /**

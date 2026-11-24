@@ -1,11 +1,11 @@
 # agent-skill-bundler
 
-Port Claude Code skill plugins to other agent platforms. **Codex** and
-**OpenCode** are implemented targets; the pipeline is target-agnostic (see
-*Adding another target*). Works on **any** standard Claude plugin, and is
-*tuned* for this workspace's `*-forge` plugins — registered ones get precise
-alias maps and **cross-plugin** reference rewriting (e.g. `code-forge` →
-`spec-forge`) that a generic converter can't do.
+Port Claude Code skill plugins to other agent platforms. **Codex**,
+**OpenCode**, and **Gemini CLI** are implemented targets; the pipeline is
+target-agnostic (see *Adding another target*). Works on **any** standard Claude
+plugin, and is *tuned* for this workspace's `*-forge` plugins — registered ones
+get precise alias maps and **cross-plugin** reference rewriting (e.g.
+`code-forge` → `spec-forge`) that a generic converter can't do.
 
 Registered plugins (optional, for precision): `spec-forge`, `code-forge`,
 `apcore-skills`, `theory-forge`, `research-forge`, `hype-forge` (see
@@ -111,19 +111,70 @@ OpenCode also scans the Codex compatibility dirs (`~/.agents/skills`,
 skill (the root `SKILL.md` blocks recursion); the prefixed OpenCode bundle in
 `~/.config/opencode/skills` wins for the root ID and adds every sub-skill.
 
+## Conversion model (Gemini CLI)
+
+Gemini CLI discovers skills **1 directory deep only** under `~/.gemini/skills/`
+(nested subdirectories like `<ns>/<skill>/SKILL.md` are ignored) and has no
+plugin namespace for skills. So a Gemini bundle uses the same rootless,
+prefixed structure on disk as OpenCode, and `install` copies each skill dir
+**flat** into `~/.gemini/skills/`:
+
+```
+~/.gemini/skills/code-forge/SKILL.md          # orchestrator
+~/.gemini/skills/code-forge-plan/SKILL.md     # sub-skill
+~/.gemini/skills/code-forge-plan/references/code-forge-shared/...
+~/.gemini/commands/code-forge/plan.toml       # -> /code-forge:plan
+~/.gemini/commands/code-forge.toml            # -> /code-forge
+~/.gemini/agents/*.md                         # custom subagents (name + description)
+```
+
+Transform differences:
+
+- Skill references such as `/spec-forge:prd` become prefixed skill names
+  such as `spec-forge-prd`. References to commands keep their Gemini slash names.
+- A skill without `description` uses the first nonempty line of its body.
+  The output uses portable skill metadata with a `name` matching its directory.
+- A plugin-root `SKILL.md` uses the plugin namespace as its Gemini skill ID.
+  If it requires manual invocation, the command uses `/<ns>`.
+- `disable-model-invocation: true` becomes a user-invoked TOML command. A
+  compatible suite command can also supply the orchestrator skill's workflow.
+- Claude tools map to Gemini CLI built-ins: `AskUserQuestion` → `ask_user`,
+  `TodoWrite` → `write_todos`, `WebFetch` → `web_fetch`, `WebSearch` →
+  `google_web_search`.
+- `Agent(subagent_type="general-purpose")` and older `Task(...)` → `generalist` (and `explore` →
+  `codebase_investigator`), with role routing to `reviewer` / `spec-author` /
+  `analyst` emitted as `~/.gemini/agents/*.md` (`name` + `description`
+  frontmatter).
+- Claude command Markdown and manifest commands become TOML commands.
+  `commands/<ns>/plan.toml` registers `/ns:plan`, and `commands/<ns>.toml`
+  registers `/ns`. Gemini supports nested command groups.
+- Skill instructions use the arguments from the latest user request. Custom
+  commands interpolate the full `$ARGUMENTS` as `{{args}}`. Static Claude
+  shell injections in commands use Gemini's `!{...}` processor, which requests
+  confirmation at invocation. Command Markdown includes and shared documents
+  are inlined. Skill resources are placed inside the skill directory so Gemini
+  can read them after activation.
+
+Gemini does not have direct equivalents for Claude's `context: fork`,
+per-skill hooks and restrictions, positional and named interpolation, or
+most Claude runtime variables. Conversion reports the source and the
+unsupported behavior. `--no-strict` keeps compatible output and excludes
+entries that require manual migration.
+
 ## Self-enforced gates (no half-product)
 
 `convert` exits non-zero if any bundle violates a gate:
 
 - **A** — no unresolved external `@../` include remains.
-- **B** — no leftover Claude-style **slash** ref (`/<ns>:<skill>`) remains (the
+- **B** — no leftover Claude-style **slash** ref (`/<ns>:<skill>`) remains in Codex or OpenCode (the
   bare `<ns>:<skill>` colon form is the correct Codex name and is allowed).
 - **B2** — prefix targets (OpenCode): no leftover bare `<ns>:<skill>` colon ref
   either; the only valid form is `<ns>-<skill>`.
 - **C** — every skill's directory name equals its frontmatter `name`.
-- **D** — every relocated `<ns>-shared/...` reference resolves on disk.
-- **E** — rootless targets (OpenCode): no `SKILL.md` at the bundle root (it
-  would hide every sub-skill) and the orchestrator exists at `<ns>/SKILL.md`.
+- **D** — shared resource references resolve. Gemini validates the source
+  before embedding the reference or copying the resource into a skill.
+- **E** — rootless targets (OpenCode and Gemini): the bundle root has no
+  `SKILL.md`. The entry skill, when present, is a child directory.
 
 Non-fatal **warnings** surface source-side issues the conversion can't fix:
 dangling cross-refs (`spec-forge:feature`), ambiguous cross-plugin bare paths,
@@ -151,26 +202,40 @@ npm install && npm run build
 # convert one or more plugins (gates enforced)
 agent-skill-bundler convert ../spec-forge ../code-forge ../apcore-skills --out ./out/codex
 agent-skill-bundler convert ../spec-forge ../code-forge --target opencode
+agent-skill-bundler convert ../spec-forge ../code-forge --target gemini
 
 # verify a bundle actually loads in the target
 agent-skill-bundler verify ./out/codex/spec-forge            # codex debug prompt-input
 agent-skill-bundler verify ./out/opencode/code-forge         # static OpenCode scan check
+agent-skill-bundler verify ./out/gemini/code-forge           # Gemini layout and YAML checks
 
-# install a bundle (Codex symlinks; OpenCode copies so its scanner cannot miss it)
+# install a bundle (Codex symlinks; OpenCode copies nested; Gemini copies flat)
 agent-skill-bundler install ./out/codex/spec-forge               # -> ~/.agents/skills/spec-forge
 agent-skill-bundler install ./out/opencode/code-forge            # -> ~/.config/opencode/skills/code-forge
+agent-skill-bundler install ./out/gemini/code-forge              # -> ~/.gemini/skills/code-forge*
 agent-skill-bundler install ./out/codex/spec-forge --home /tmp/test
 ```
 
-`install` / `verify` infer the target from the bundle shape unless `--target`
-is given: a root `SKILL.md` means Codex, `<ns>/SKILL.md` means OpenCode.
-`install` replaces an existing `<ns>` entry in the target's skills dir (and the
-matching command/agent entries), so re-running it after a reconvert is safe.
+New Gemini bundles record their target and namespace in
+`.agent-skill-bundler.json`. Keep sibling `commands/` and `agents/` directories
+when moving the output. Older bundles use layout-based inference and can pass
+`--target` explicitly.
+
+Gemini installation records the files it owns. Reinstalling updates those
+files and removes obsolete ones whose contents are unchanged. It reports
+name conflicts before replacing files. Upgrading a bundled default agent also
+updates its co-owners when the installed agent is unchanged. If an older
+install predates ownership tracking, move the conflicting files out of the way
+before reinstalling.
+Codex and OpenCode replace the corresponding bundle entry on reinstall.
 
 In Codex: restart, then `/skills` or name a skill, e.g. `spec-forge:prd`.
 
 In OpenCode: config reloads automatically; use `/code-forge/plan`, or load a
 skill by ID (`code-forge-plan`) or mention `@code-forge-plan`.
+
+In Gemini CLI: run `/skills reload` and `/commands reload` (or restart); use
+`/code-forge:plan` or let Gemini activate `code-forge-plan` via `activate_skill`.
 
 ## Verifying (three tiers)
 
@@ -183,29 +248,28 @@ skill by ID (`code-forge-plan`) or mention `@code-forge-plan`.
    OpenCode has no equivalent prompt dump, so its verify mirrors the documented
    scan rules statically (root-level `*.md` + nested `SKILL.md`, stop at a
    `SKILL.md`, skip hidden/`node_modules`, six levels deep) and reports command
-   entries. (Output layout is valid.)
+   entries. Gemini verifies the flat layout, required YAML fields and declared
+   skill IDs offline, and checks the command count against the bundle metadata.
 3. **Interactive** — `codex` → `/skills`, then invoke `spec-forge:prd` on a real
    task and watch it run. (End-to-end; this one calls the model.)
 
 `npm test` runs golden tests (`test/fixtures/fixture-forge`) for regression
 safety on the converter itself.
 
-## Adding another target (Gemini, OpenCode, ...)
+## Adding another target (Cursor, Windsurf, ...)
 
 The core pipeline is target-agnostic; a target is data in `src/targets.ts`
-(`skillsDir`, `commandsDir`, `nameStyle`, `layout`, `toolRemap`,
-`expandsAtIncludes`, agent format). `nameStyle` + `layout` are the two axes that
-matter: `namespace`/`bundle` (Codex) vs `prefix`/`rootless` (OpenCode). Gemini,
-for example, natively expands `@` includes and supports namespaced `.toml`
-commands, so its target would set `expandsAtIncludes: true` and use a different
-layout emitter.
+(`skillsDir`, `commandsDir`, `commandFormat`, `nameStyle`, `layout`,
+`skillsInstallFlat`, `toolRemap`, `expandsAtIncludes`, agent format).
+`nameStyle` + `layout` are the two axes that matter: `namespace`/`bundle`
+(Codex) vs `prefix`/`rootless` (OpenCode, Gemini).
 
 ## Scope
 
-Works on **any** standard Claude plugin (`.claude-plugin/plugin.json` +
-`skills/<name>/SKILL.md`): unregistered plugins convert via a generic
-auto-derived spec (empty aliases, SKILL.md-presence skill detection,
-own-namespace cross-ref rewriting). **Registering** a plugin in
+Unregistered plugins using the standard `.claude-plugin/plugin.json` and
+`skills/<name>/SKILL.md` layout convert via a generic spec. Gemini also discovers
+plugin-root skills and honors additional skill paths and command overrides
+declared in the Claude manifest. **Registering** a plugin in
 `src/registry.ts` is optional and adds precision — short alias maps (e.g.
 `prd-generation` → `prd`) and recognition of its namespace inside *other*
 plugins' cross-references. The six `*-forge` suites are registered.
